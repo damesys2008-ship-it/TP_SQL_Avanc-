@@ -1,0 +1,109 @@
+RÉSULTATS EXPLAIN ANALYZE — TP SQL Avancé
+Samir MAMA — CODA 2e année
+Exécution : PostgreSQL 16, base datalab_b2 (240 commandes 2024-2026)
+Les temps (ms) varient d'une exécution à l'autre ; les coûts et cardinalités sont stables.
+
+
+===================================================================
+Q1 — Requête d origine (YEAR(), SELECT *)
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.81..8.82 rows=1 width=33) (actual time=0.171..0.174 rows=10 loops=1)
+   ->  Sort  (cost=8.81..8.82 rows=1 width=33) (actual time=0.170..0.171 rows=10 loops=1)
+         Sort Key: montant_total DESC
+         Sort Method: top-N heapsort  Memory: 26kB
+         ->  Seq Scan on commandes  (cost=0.00..8.80 rows=1 width=33) (actual time=0.101..0.118 rows=41 loops=1)
+               Filter: (((statut)::text = 'LIVREE'::text) AND ((EXTRACT(year FROM date_commande))::integer = 2026))
+               Rows Removed by Filter: 199
+ Planning Time: 0.550 ms
+ Execution Time: 0.219 ms
+(9 rows)
+
+
+===================================================================
+Q2 — Requête SARGable sur commandes, après création de idx_cmd_statut_date
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=9.06..9.09 rows=10 width=17) (actual time=0.069..0.071 rows=10 loops=1)
+   ->  Sort  (cost=9.06..9.16 rows=40 width=17) (actual time=0.068..0.069 rows=10 loops=1)
+         Sort Key: montant_total DESC
+         Sort Method: top-N heapsort  Memory: 26kB
+         ->  Seq Scan on commandes  (cost=0.00..8.20 rows=40 width=17) (actual time=0.021..0.035 rows=41 loops=1)
+               Filter: ((date_commande >= '2026-01-01'::date) AND (date_commande < '2027-01-01'::date) AND ((statut)::text = 'LIVREE'::text))
+               Rows Removed by Filter: 199
+ Planning Time: 0.169 ms
+ Execution Time: 0.088 ms
+(9 rows)
+
+
+===================================================================
+Q2 — Même requête avec SET enable_seqscan = off (preuve que l index est utilisable)
+                                                                       QUERY PLAN                                                                       
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10.34..10.37 rows=10 width=17) (actual time=0.211..0.213 rows=10 loops=1)
+   ->  Sort  (cost=10.34..10.44 rows=40 width=17) (actual time=0.210..0.211 rows=10 loops=1)
+         Sort Key: montant_total DESC
+         Sort Method: top-N heapsort  Memory: 26kB
+         ->  Bitmap Heap Scan on commandes  (cost=4.78..9.48 rows=40 width=17) (actual time=0.187..0.193 rows=41 loops=1)
+               Recheck Cond: (((statut)::text = 'LIVREE'::text) AND (date_commande >= '2026-01-01'::date) AND (date_commande < '2027-01-01'::date))
+               Heap Blocks: exact=1
+               ->  Bitmap Index Scan on idx_cmd_statut_date  (cost=0.00..4.77 rows=40 width=0) (actual time=0.032..0.032 rows=41 loops=1)
+                     Index Cond: (((statut)::text = 'LIVREE'::text) AND (date_commande >= '2026-01-01'::date) AND (date_commande < '2027-01-01'::date))
+ Planning Time: 0.066 ms
+ Execution Time: 0.234 ms
+(11 rows)
+
+
+===================================================================
+Q2 — Requête SARGable sur la table partitionnée (Partition Pruning : seule commandes_2026 est lue)
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=3.29..3.31 rows=10 width=17) (actual time=0.043..0.045 rows=10 loops=1)
+   ->  Sort  (cost=3.29..3.39 rows=41 width=17) (actual time=0.042..0.043 rows=10 loops=1)
+         Sort Key: commandes_part.montant_total DESC
+         Sort Method: top-N heapsort  Memory: 26kB
+         ->  Seq Scan on commandes_2026 commandes_part  (cost=0.00..2.40 rows=41 width=17) (actual time=0.007..0.020 rows=41 loops=1)
+               Filter: ((date_commande >= '2026-01-01'::date) AND (date_commande < '2027-01-01'::date) AND ((statut)::text = 'LIVREE'::text))
+               Rows Removed by Filter: 39
+ Planning Time: 0.327 ms
+ Execution Time: 0.060 ms
+(9 rows)
+
+
+===================================================================
+Q2 — Contre-preuve : YEAR() sur la table partitionnée (pas d élagage, 3 partitions lues)
+                                                                 QUERY PLAN                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=7.84..7.85 rows=3 width=17) (actual time=0.089..0.091 rows=10 loops=1)
+   ->  Sort  (cost=7.84..7.85 rows=3 width=17) (actual time=0.088..0.090 rows=10 loops=1)
+         Sort Key: commandes_part.montant_total DESC
+         Sort Method: top-N heapsort  Memory: 26kB
+         ->  Append  (cost=0.00..7.82 rows=3 width=17) (actual time=0.042..0.065 rows=41 loops=1)
+               ->  Seq Scan on commandes_2024 commandes_part_1  (cost=0.00..2.60 rows=1 width=17) (actual time=0.022..0.022 rows=0 loops=1)
+                     Filter: (((statut)::text = 'LIVREE'::text) AND ((EXTRACT(year FROM date_commande))::integer = 2026))
+                     Rows Removed by Filter: 80
+               ->  Seq Scan on commandes_2025 commandes_part_2  (cost=0.00..2.60 rows=1 width=17) (actual time=0.016..0.016 rows=0 loops=1)
+                     Filter: (((statut)::text = 'LIVREE'::text) AND ((EXTRACT(year FROM date_commande))::integer = 2026))
+                     Rows Removed by Filter: 80
+               ->  Seq Scan on commandes_2026 commandes_part_3  (cost=0.00..2.60 rows=1 width=17) (actual time=0.003..0.022 rows=41 loops=1)
+                     Filter: (((statut)::text = 'LIVREE'::text) AND ((EXTRACT(year FROM date_commande))::integer = 2026))
+                     Rows Removed by Filter: 39
+ Planning Time: 0.319 ms
+ Execution Time: 0.110 ms
+(16 rows)
+
+
+===================================================================
+Q7 — Plan de la correction NOT EXISTS (anti-jointure)
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Hash Right Anti Join  (cost=1.27..2.49 rows=6 width=18) (actual time=0.030..0.034 rows=6 loops=1)
+   Hash Cond: (s.manager_id = e.id)
+   ->  Seq Scan on employes s  (cost=0.00..1.12 rows=12 width=4) (actual time=0.001..0.002 rows=12 loops=1)
+   ->  Hash  (cost=1.12..1.12 rows=12 width=18) (actual time=0.017..0.017 rows=12 loops=1)
+         Buckets: 1024  Batches: 1  Memory Usage: 9kB
+         ->  Seq Scan on employes e  (cost=0.00..1.12 rows=12 width=18) (actual time=0.003..0.005 rows=12 loops=1)
+ Planning Time: 0.317 ms
+ Execution Time: 0.048 ms
+(8 rows)
+

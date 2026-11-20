@@ -1,0 +1,512 @@
+TP SQL AVANCE ET NoSQL
+Samir MAMA — CODA 2e année
+Base utilisée : datalab_b2
+
+
+PARTIE A — AUDIT, OPTIMISATION ET INDEXATION SQL
+
+
+Question 1 — Analyse de la requête initiale
+
+J'ai exécuté la requête demandée pour rechercher les dix commandes LIVREE de 2026 ayant le montant le plus élevé. J'ai utilisé EXTRACT(YEAR FROM date_commande), puisque PostgreSQL ne possède pas la fonction YEAR().
+
+EXPLAIN ANALYZE
+SELECT *
+FROM commandes
+WHERE EXTRACT(YEAR FROM date_commande) = 2026
+  AND statut = 'LIVREE'
+ORDER BY montant_total DESC
+LIMIT 10;
+
+Sur la base utilisée, PostgreSQL obtient 41 commandes livrées en 2026, pour un total de 240 commandes.
+
+Premier défaut : le prédicat n'est pas SARGable. La fonction EXTRACT est appliquée à date_commande pour chaque ligne. PostgreSQL ne peut donc pas exploiter directement un index B-Tree portant sur cette colonne. Le plan utilise un Seq Scan et calcule ensuite le filtre sur toutes les lignes.
+
+Deuxième défaut : SELECT * demande toutes les colonnes de la table. Cela augmente le volume transporté par le moteur et empêche l'utilisation d'un Index Only Scan. Les colonnes réellement utiles sont moins nombreuses.
+
+Le plan contient aussi un nœud Sort pour classer les lignes selon montant_total avant de conserver les dix premières. Les lignes estimées par l'optimiseur peuvent également être très éloignées des lignes réellement retournées.
+
+
+Question 2 — Index, réécriture SARGable et partitionnement
+
+J'ai créé un index partiel sur les commandes livrées, en mettant la colonne de filtrage avant la colonne d'intervalle :
+
+CREATE INDEX idx_cmd_statut_date
+ON commandes (statut, date_commande)
+INCLUDE (client_id, montant_total);
+
+Cet index permet de retrouver rapidement les commandes livrées dans une période donnée. Les colonnes client_id et montant_total sont incluses afin de rendre l'index potentiellement couvrant.
+
+La requête initiale a ensuite été réécrite avec des bornes de date :
+
+EXPLAIN ANALYZE
+SELECT id, client_id, date_commande, montant_total
+FROM commandes
+WHERE statut = 'LIVREE'
+  AND date_commande >= DATE '2026-01-01'
+  AND date_commande < DATE '2027-01-01'
+ORDER BY montant_total DESC
+LIMIT 10;
+
+Cette formulation est SARGable : elle laisse la colonne date_commande intacte et permet à l'optimiseur de chercher directement dans les valeurs indexées.
+
+J'ai aussi créé une table partitionnée afin de représenter l'évolution vers un historique plus important :
+
+CREATE TABLE commandes_part (
+    id INT NOT NULL,
+    client_id INT NOT NULL REFERENCES clients(id),
+    date_commande DATE NOT NULL,
+    statut VARCHAR(20) NOT NULL,
+    canal VARCHAR(20),
+    montant_total NUMERIC(10,2),
+    PRIMARY KEY (id, date_commande)
+) PARTITION BY RANGE (date_commande);
+
+CREATE TABLE commandes_2024 PARTITION OF commandes_part
+FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE commandes_2025 PARTITION OF commandes_part
+FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+CREATE TABLE commandes_2026 PARTITION OF commandes_part
+FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+L'identifiant et la colonne date_commande figurent ensemble dans la clé primaire. C'est nécessaire pour respecter la contrainte PostgreSQL qui impose que la clé de partition fasse partie de toute clé primaire ou unique.
+
+J'ai ensuite copié les données existantes :
+
+INSERT INTO commandes_part (
+    id,
+    client_id,
+    date_commande,
+    statut,
+    canal,
+    montant_total
+)
+SELECT id,
+       client_id,
+       date_commande,
+       statut,
+       canal,
+       montant_total
+FROM commandes;
+
+J'ai exécuté une nouvelle fois la requête avec les bornes 2026 sur la table partitionnée :
+
+EXPLAIN ANALYZE
+SELECT id, client_id, date_commande, montant_total
+FROM commandes_part
+WHERE statut = 'LIVREE'
+  AND date_commande >= DATE '2026-01-01'
+  AND date_commande < DATE '2027-01-01'
+ORDER BY montant_total DESC
+LIMIT 10;
+
+Le plan ne parcourt normalement que la partition commandes_2026. Les partitions 2024 et 2025 sont éliminées avant la lecture grâce au Partition Pruning.
+
+Avec une requête utilisant EXTRACT, PostgreSQL ne peut pas effectuer cet élagage sur les dates. Les trois partitions peuvent alors être ajoutées au nœud Append.
+
+Dans la petite base de test, PostgreSQL peut choisir un Seq Scan sur les lignes de la partition 2026. Lire 80 lignes dans une ou deux pages peut coûter moins cher que de lire puis rejoindre les données de l'index. Cela ne remet pas en cause l'utilité de l'index : sur une grande table, les données concernées représentent une proportion beaucoup plus faible et un index devient préférable.
+
+
+Question 3 — Vue matérialisée par segment client
+
+J'ai créé une vue matérialisée calculant, pour chaque segment, le nombre de commandes et le chiffre d'affaires :
+
+CREATE MATERIALIZED VIEW mv_synthese_segments AS
+SELECT cl.segment,
+       COUNT(co.id) AS nb_commandes,
+       ROUND(SUM(co.montant_total), 2) AS ca_total
+FROM commandes co
+JOIN clients cl ON cl.id = co.client_id
+GROUP BY cl.segment;
+
+J'ai ajouté un index unique sur segment afin de permettre un rafraîchissement concurrent :
+
+CREATE UNIQUE INDEX ux_mv_synthese_segment
+ON mv_synthese_segments (segment);
+
+J'ai ensuite inséré une commande test pour Adam Barbier, client n°24 du segment PME :
+
+INSERT INTO commandes (
+    id,
+    client_id,
+    date_commande,
+    statut,
+    canal,
+    montant_total
+)
+VALUES (
+    241,
+    24,
+    DATE '2026-11-20',
+    'LIVREE',
+    'WEB',
+    2450.00
+);
+
+La nouvelle commande n'apparaissait pas immédiatement dans la vue matérialisée. Celle-ci conserve une photographie des résultats créée au moment du dernier refresh. Sur ma base de test, je devais donc passer de 70 à 71 commandes dans le segment PME, et de 354430 € à 356880 €.
+
+J'ai ensuite rafraîchi la vue :
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_synthese_segments;
+
+Après le rafraîchissement, le segment PME affiche les nouvelles valeurs.
+
+Une vue classique aurait recalculé la requête à chaque lecture. Avec une vue matérialisée, les lecteurs bénéficient du résultat déjà enregistré sur disque. En contrepartie, les données restent obsolètes jusqu'au prochain rafraîchissement.
+
+
+PARTIE B — NORMALISATION ET REQUÊTES ANALYTIQUES AVANCÉES
+
+
+Question 4 — Passage en troisième forme normale
+
+La table soumise contient les colonnes suivantes :
+
+affectations_brutes(
+    employe_id,
+    employe_nom,
+    dept_nom,
+    projets_liste,
+    chef_projet,
+    chef_projet_tel
+)
+
+Cette table présente plusieurs problèmes.
+
+Première forme normale
+
+La colonne projets_liste contient plusieurs noms de projets séparés par des virgules dans une seule cellule. Cette valeur n'est pas atomique. J'ai donc créé une ligne distincte pour chaque couple employé/projet.
+
+Deuxième forme normale
+
+Avec une clé composée (employe_id, projet_id), employe_nom et dept_nom ne dépendent que de employe_id. Ce ne sont pas des attributs propres à toute la clé composite. Le nom du projet est également une information propre au projet.
+
+Les attributs ont donc été déplacés dans des tables spécifiques.
+
+Troisième forme normale
+
+La colonne chef_projet_tel dépend du chef du projet, et non directement du projet. La dépendance était transitive :
+
+projet -> chef_projet -> chef_projet_tel
+
+J'ai isolé les chefs dans une table dédiée.
+
+Le schéma final est le suivant :
+
+departements(
+    id PK,
+    nom UNIQUE
+)
+
+collaborateurs(
+    id PK,
+    nom,
+    departement_id FK vers departements
+)
+
+chefs_projet(
+    id PK,
+    nom UNIQUE,
+    telephone
+)
+
+projets(
+    id PK,
+    nom UNIQUE,
+    chef_projet_id FK vers chefs_projet
+)
+
+affectations(
+    collaborateur_id FK,
+    projet_id FK,
+    PRIMARY KEY(collaborateur_id, projet_id)
+)
+
+Les colonnes du jeu d'essai ont été migrées avec des jointures. La colonne projets_liste a été éclatée à l'aide de string_to_array() et unnest().
+
+Une jointure finale permet de reconstituer la vue métier initiale sans conserver les données répétées :
+
+SELECT c.id AS employe_id,
+       c.nom AS employe_nom,
+       d.nom AS dept_nom,
+       p.nom AS projet,
+       cp.nom AS chef_projet,
+       cp.telephone AS chef_projet_tel
+FROM affectations a
+JOIN collaborateurs c ON c.id = a.collaborateur_id
+JOIN departements d ON d.id = c.departement_id
+JOIN projets p ON p.id = a.projet_id
+JOIN chefs_projet cp ON cp.id = p.chef_projet_id
+ORDER BY c.id, p.nom;
+
+
+Question 5 — CTE avec DENSE_RANK
+
+J'ai utilisé une CTE pour rendre le classement lisible :
+
+WITH classement AS (
+    SELECT cat.nom AS categorie,
+           p.nom AS produit,
+           p.prix_unitaire,
+           DENSE_RANK() OVER (
+               PARTITION BY p.categorie_id
+               ORDER BY p.prix_unitaire DESC
+           ) AS rang_prix
+    FROM produits p
+    JOIN categories cat ON cat.id = p.categorie_id
+)
+SELECT categorie, produit, prix_unitaire, rang_prix
+FROM classement
+WHERE rang_prix <= 2
+ORDER BY categorie, rang_prix, produit;
+
+PARTITION BY sépare les produits en catégories indépendantes. Dans chaque catégorie, ORDER BY classe les produits du plus cher au moins cher.
+
+DENSE_RANK attribue 1 au prix le plus élevé, puis 2 au rang suivant. En cas d'ex-aequo, les deux produits peuvent avoir le même rang. Contrairement à RANK, aucun rang n'est sauté : la séquence est 1, 2, 2, 3.
+
+Le filtre rang_prix <= 2 doit être placé après la CTE. Une fonction de fenêtrage ne peut pas être utilisée directement dans le WHERE de sa propre requête.
+
+
+Question 6 — Organigramme récursif
+
+La requête récursive commence par la CTO :
+
+WITH RECURSIVE organigramme AS (
+    SELECT id,
+           nom,
+           poste,
+           departement,
+           1 AS niveau,
+           nom::TEXT AS chemin
+    FROM employes
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT e.id,
+           e.nom,
+           e.poste,
+           e.departement,
+           o.niveau + 1,
+           o.chemin || ' > ' || e.nom
+    FROM employes e
+    JOIN organigramme o ON e.manager_id = o.id
+    WHERE o.niveau < 20
+)
+SELECT id, nom, poste, departement, niveau, chemin
+FROM organigramme
+ORDER BY niveau, id;
+
+Le terme d'ancrage récupère Claire Moreau, qui n'a pas de manager. Le terme récursif recherche ensuite les employés dont manager_id correspond à un identifiant déjà trouvé.
+
+Chaque passage augmente le niveau d'une unité. L'opérateur || concatène les noms pour former le chemin complet.
+
+La condition niveau < 20 est une limite de sécurité. Elle évite qu'une donnée circulaire ne fasse tourner la récursion indéfiniment.
+
+
+PARTIE C — TRANSACTIONS ACID, AUDIT ET CHOIX NoSQL
+
+
+Question 7 — Le piège de NOT IN
+
+La requête suivante peut renvoyer zéro ligne :
+
+SELECT id, nom
+FROM employes
+WHERE id NOT IN (
+    SELECT manager_id
+    FROM employes
+);
+
+Cela arrive parce que Claire Moreau a manager_id NULL. La sous-requête contient donc une valeur NULL.
+
+Pour PostgreSQL, une comparaison avec NULL produit UNKNOWN. Une expression combinant des valeurs égales ou différentes avec UNKNOWN peut donc ne jamais devenir TRUE. Le résultat est une absence de lignes, sans erreur explicite.
+
+La solution la plus sûre est NOT EXISTS :
+
+SELECT e.id, e.nom
+FROM employes e
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM employes s
+    WHERE s.manager_id = e.id
+)
+ORDER BY e.id;
+
+NOT EXISTS vérifie simplement qu'il n'existe pas d'employé encadré par la ligne courante. La présence de NULL dans manager_id ne contamine pas la comparaison.
+
+Une alternative avec LEFT JOIN est également possible :
+
+SELECT e.id, e.nom
+FROM employes e
+LEFT JOIN employes s ON s.manager_id = e.id
+WHERE s.id IS NULL
+ORDER BY e.id;
+
+Filtrer explicitement les NULL dans une sous-requête NOT IN fonctionne comme rustine, mais cette précaution peut facilement être oubliée.
+
+
+Question 8 — Concurrence et WAL
+
+Scénario avec READ COMMITTED
+
+Dans une première session, j'ai ouvert une transaction puis lu le compte 1 :
+
+BEGIN ISOLATION LEVEL READ COMMITTED;
+
+SELECT solde
+FROM comptes_bancaires
+WHERE id = 1;
+
+Avec READ COMMITTED, la première lecture a retourné 15000.00 €.
+
+Dans une deuxième session, j'ai diminué le solde puis validé la modification :
+
+BEGIN;
+
+UPDATE comptes_bancaires
+SET solde = solde - 1000
+WHERE id = 1;
+
+COMMIT;
+
+La première session, sans être terminée, a relu le compte :
+
+SELECT solde
+FROM comptes_bancaires
+WHERE id = 1;
+
+Elle a obtenu 14000.00 €. La même transaction avait obtenu 15000.00 € lors de la première instruction.
+
+Cela représente un Non-Repeatable Read : une même ligne a fourni deux valeurs différentes à l'intérieur de la première transaction. Avec READ COMMITTED, PostgreSQL prend un nouveau snapshot pour chaque instruction.
+
+Scénario avec REPEATABLE READ
+
+J'ai ensuite répété le test avec REPEATABLE READ :
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+
+SELECT solde
+FROM comptes_bancaires
+WHERE id = 1;
+
+Une autre session a diminué le solde puis a effectué COMMIT. Dans la première transaction, la nouvelle lecture a encore affiché 15000.00 €.
+
+Le snapshot MVCC reste le même jusqu'à la fin de la transaction. Une nouvelle transaction est nécessaire pour voir la nouvelle valeur enregistrée par l'autre session.
+
+Si une transaction essayait de modifier une ligne changée par une autre transaction après son snapshot, PostgreSQL peut également déclencher une erreur de sérialisation.
+
+Rôle du WAL lors d'un virement
+
+Un virement peut être représenté ainsi :
+
+BEGIN;
+
+UPDATE comptes_bancaires
+SET solde = solde - 1000
+WHERE id = 1;
+
+UPDATE comptes_bancaires
+SET solde = solde + 1000
+WHERE id = 2;
+
+COMMIT;
+
+Le Write-Ahead Log contient les modifications avant que les pages de données soient définitivement écrites sur le disque.
+
+Si le serveur coupe avant COMMIT, la recovery ne trouvera pas d'enregistrement COMMIT pour cette transaction. Les deux modifications seront annulées : aucun débit ni crédit n'est visible. L'opération reste atomique.
+
+Si la coupure survient après l'acquittement du COMMIT, l'enregistrement COMMIT a déjà été synchronisé dans le WAL. Au redémarrage, PostgreSQL rejoue les changements confirmés : le débit et le crédit sont tous les deux reconstruits.
+
+Cette utilisation du WAL garantit la durabilité. Avec les contraintes SQL et les transactions, elle participe aussi à l'atomicité et à la cohérence.
+
+
+Question 9 — Architecture polyglotte pour un covoiturage
+
+J'ai choisi une architecture spécialisée pour les quatre besoins principaux : suivi GPS, paiements, relations sociales et données proches du temps réel.
+
+PostgreSQL pour la facturation
+
+PostgreSQL est adapté aux utilisateurs, trajets, paiements et factures, car les données sont relationnelles et les montants doivent être exacts.
+
+J'ai proposé les tables suivantes :
+
+cov_utilisateurs
+cov_trajets
+cov_factures
+
+La clé d'idempotence empêche qu'une même demande de paiement soit comptée plusieurs fois après une nouvelle tentative réseau.
+
+Le schéma utilise des clés étrangères, des contraintes CHECK et une transaction SQL pour garantir qu'un paiement reste cohérent.
+
+Pour CAP/PACELC, PostgreSQL peut être classé PC/EC : en cas de partition réseau, je préfère bloquer une transaction plutôt que risquer un double débit. En fonctionnement normal, la cohérence passe avant la latence minimale.
+
+Cassandra ou ScyllaDB pour le GPS
+
+Les 30000 véhicules qui envoient leur position toutes les trois secondes produisent environ 10000 écritures GPS par seconde :
+
+30000 / 3 = 10000 positions par seconde
+
+Une base Wide-Column est plus adaptée à ce volume. Je modéliserais une partition par véhicule et jour, puis un clustering par horodatage :
+
+Partition key : vehicule_id + jour
+Clustering key : timestamp
+Valeurs : latitude, longitude, vitesse, direction
+
+La première requête sera donc par véhicule et période, ce qui évite les lectures aléatoires. Les nouvelles lignes sont ajoutées chronologiquement.
+
+Une légère perte ou arrivée tardive d'une position est acceptable. L'architecture peut favoriser la disponibilité et la latence, avec un profil proche de PA/EL.
+
+Redis pour les positions courantes
+
+Redis peut conserver la dernière position connue de chaque véhicule, avec une durée d'expiration courte. La lecture se fait par clé :
+
+position:<vehicule_id>
+
+Cette base est utile pour la carte en temps réel. Cassandra garde l'historique complet, tandis que Redis fournit une valeur rapidement accessible.
+
+Redis ne remplace pas PostgreSQL pour les paiements : il est destiné aux données temporairement disponibles.
+
+Neo4j pour les relations
+
+Neo4j convient aux relations utilisateur, trajet, lieu et ami. Il permet de chercher des utilisateurs ou des itinéraires à plusieurs sauts sans transformer les relations en nombreuses jointures SQL.
+
+Un exemple de recommandation est :
+
+MATCH (moi:Utilisateur)-[:CONNAIT*1..3]-(ami:Utilisateur)
+WHERE ami <> moi
+RETURN DISTINCT ami
+
+Les relations peuvent être modélisées avec CONNAIT, PARTICIPE_AU_TRAJET, PASSE_PAR ou PROPOSE_ITINERAIRE.
+
+Pour les recommandations, une cohérence immédiate n'est pas aussi critique que pour un paiement. Une recommandation légèrement ancienne reste exploitable.
+
+Architecture globale
+
+Une architecture possible est :
+
+Application mobile
+    |
+    +-- PostgreSQL : utilisateurs, trajets, factures et paiements
+    |
+    +-- Redis : dernière position et cache des véhicules proches
+    |
+    +-- Cassandra : historique des positions GPS
+    |
+    +-- Neo4j : relations, amis et recommandations
+
+À la fin d'un trajet :
+
+- PostgreSQL effectue la transaction comptable ;
+- Cassandra conserve les positions GPS ;
+- Redis retire ou met à jour les positions actives ;
+- Neo4j ajoute les nouvelles relations entre participants ;
+- une file de messages peut découpler ces mises à jour.
+
+Cette solution respecte les quatre critères du TP :
+
+1. Cohérence : PostgreSQL pour l'argent, cohérence éventuelle pour le reste.
+2. Scalabilité : Cassandra pour les écritures horaires massives, PostgreSQL pour les données relationnelles.
+3. Structure : SQL pour les données fixes, Wide-Column pour les séries temporelles et graphe pour les relations.
+4. Nature des accès : jointures et rapports SQL, lecture de clé dans Redis, parcours de voisinage dans Neo4j.
